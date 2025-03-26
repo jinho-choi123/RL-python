@@ -24,17 +24,20 @@ env = gym.make("CartPole-v1")
 # Setup Q-Net
 # Action-Value Function(Q) Approximation
 class QNet(nn.Module):
-    def __init__(self, hidden_dim=64):
+    def __init__(self, hidden_dim=128):
         super().__init__()
 
-        self.hidden = nn.Linear(4, hidden_dim)
-        self.output = nn.Linear(hidden_dim, 2)
+        self.linear1 = nn.Linear(4, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, 2 * hidden_dim)
+        self.output = nn.Linear(2 * hidden_dim, 2)
 
     def forward(self, s):
-        outs = self.hidden(s)
-        outs = F.relu(outs)
-        outs = self.output(outs)
-        return outs
+        x = self.linear1(s)
+        x = F.relu(x)
+        x = self.linear2(x)
+        x = F.relu(x)
+        x = self.output(x)
+        return x
 
 q_model = QNet().to(device)
 q_target_model = QNet().to(device)
@@ -228,13 +231,15 @@ for epoch in range(100000):
 
     if epoch % 200 == 1:
         copy_param_to_target_mode(q_model, q_target_model)
-        print(f"Run iteration {epoch} | evaluated rewards {eval_rewards[-1]:.3f}")
+        print(f"Run iteration {epoch} | last evaluated rewards {eval_rewards[-1]:.3f}")
+        print(f"Run iteration {epoch} | average evaluated rewards {np.mean(eval_rewards[-200:]):.3f}")
+        print("\n")
 
 
     if epsilon - epsilon_decay >= epsilon_final:
         epsilon -= epsilon_decay
 
-    if np.mean(eval_rewards[-200:]) > 495.0:
+    if len(eval_rewards) > 200 and np.mean(eval_rewards[-200:]) > 495.0:
         break
 
 env.close()
