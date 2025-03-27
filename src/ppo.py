@@ -22,7 +22,6 @@ env = gym.make("CartPole-v1")
 
 gamma = 0.99
 
-
 # %%
 # Define Actor Network and Critic Network
 class ActorNet(nn.Module):
@@ -55,15 +54,10 @@ actor_net = ActorNet().to(device)
 critic_net = CriticNet().to(device)
 
 # %%
-
 # define helper function that pick action
+# It also returns the discrete distribution of each action probability
 
 def pick_action(state_, actor_model_):
-    """
-    Get the action distribution for input state
-    Since the output is logits, we should manually convert it into probability.
-    """
-
     with torch.no_grad():
         # NP doesn't have unsqueeze
         # state_batch = state_.unsqueeze(dim=0)
@@ -72,36 +66,41 @@ def pick_action(state_, actor_model_):
         # shape of state_batch: (1, 4)
         state_batch = torch.tensor(state_batch, dtype=torch.float).to(device)
 
-        # get logits for the state using policy-network
-        # shape of logits: (1, 2)
-        logits = actor_model_(state_batch)
+        logits_batch = actor_model_(state_batch)
 
-        # since we are dealing with single state, we squeeze the logits
-        logits = logits.squeeze(dim=0)
+        logits = logits_batch.squeeze(dim=0)
 
         probs = F.softmax(logits, dim=-1)
 
-        a = torch.multinomial(probs, num_samples=1)
+        actions = torch.multinomial(probs, num_samples=1)
+        action = actions.tolist()[0]
 
-        return a.tolist()[0]
+        log_probs = torch.log(probs)
 
-# define helper function for training
+        return action, logits, log_probs
 
-# We are going to train critic model with Monte-Carlo method
-# And actor model using Monte-Carlo method
-# You can change the method to TD(lambda) or TD(0).
-# But for this specific example, Monte-Carlo works much better
-def train_step(actor_optimizer_: Optimizer, critic_optimizer_: Optimizer):
+# %%
+# Define train_step helper function
+# For PPO, we train actor model and critic model at the same time
+# With single optimizer!!
+
+KL_FACTOR = 0.3
+VF_LOSS_FACTOR=0.5
+
+def train_step(optimizer_: Optimizer):
     done = False
     states = []
     actions = []
     rewards = []
 
+    logits = []
+    log_probs = []
+
     curr_state, _ = env.reset()
 
     while not done:
         states.append(curr_state.tolist())
-        action = pick_action(curr_state, actor_net)
+        action, logit, log_prob = pick_action(curr_state, actor_net)
 
         next_state, reward, term, trunc, _ = env.step(action)
 
@@ -110,16 +109,27 @@ def train_step(actor_optimizer_: Optimizer, critic_optimizer_: Optimizer):
 
         actions.append(action)
         rewards.append(reward)
+        logits.append(logit)
+        log_probs.append(log_prob)
 
     states = torch.tensor(states, dtype=torch.float).to(device)
     next_states = torch.roll(states, -1, 0)
     next_states[-1] = 0
 
-    actions = torch.tensor(actions, dtype=torch.long).to(device)
 
+    actions = torch.tensor(actions, dtype=torch.long).to(device)
+    logits = torch.stack(logits).to(device)
+    log_probs = torch.stack(log_probs).to(device)
+
+    ## CALCULATE CRITIC LOSS
     # critic values of each state
     # shape: (len(states), )
+
+    # state values
     critic_values = critic_net(states)
+
+    # logits
+    actor_values  = actor_net(states)
 
     cummulative_rewards = np.zeros_like(rewards)
     for i in reversed(range(len(rewards))):
@@ -128,73 +138,67 @@ def train_step(actor_optimizer_: Optimizer, critic_optimizer_: Optimizer):
     cummulative_rewards = torch.tensor(cummulative_rewards, dtype=torch.float).unsqueeze(dim=-1).to(device)
     rewards = torch.tensor(rewards, dtype=torch.float).unsqueeze(dim=-1).to(device)
 
-    # we use advantages to train critic net
-    critic_loss = F.mse_loss(critic_values, cummulative_rewards)
-
-    critic_optimizer_.zero_grad()
-    critic_loss.backward()
-    critic_optimizer_.step()
+    critic_loss = F.mse_loss(critic_values, cummulative_rewards, reduction="none").squeeze(dim=-1)
 
 
-    # Then we train the actor
-    # Recalculate the critic values with updated critic_net
-    with torch.no_grad():
-        critic_values = critic_net(states)
+    ## CALCULATE ACTOR LOSS
 
-        # TD(0)
-        # For this case, Monte-Carlo works much much better...
-        # next_state_critic_values = critic_net(next_states)
-        # advantages = rewards + gamma * next_state_critic_values - critic_values
+    # calculate advantages
+    advantages = cummulative_rewards - critic_values
+    # normalize advantages
+    advantages = (advantages - torch.mean(advantages)) / torch.std(advantages)
+    advantages = advantages.squeeze(dim=-1)
 
-        # Monte-Carlo
-        advantages = cummulative_rewards - critic_values
 
-        # normalize advantages
-        advantages = (advantages - torch.mean(advantages)) / torch.std(advantages)
+    # calculate the kl-divergence
+    # KL divergance between grad-tracking logits and no-grad-tracking logits
+    new_logits = actor_values
+    old_logits = logits
 
-    logits = actor_net(states)
 
-    # we wrote as this form for understanding.
-    probs = F.softmax(logits, dim=-1)
 
-    # log probability of all actions
-    log_probs_ = torch.log(probs)
+    kl_divergances = []
+    prob_ratios = []
+    for state_id in range(new_logits.size(0)):
+        new_dist = torch.distributions.Categorical(logits=new_logits[state_id])
+        old_dist = torch.distributions.Categorical(logits=old_logits[state_id])
 
-    # get the one-hot actions
-    actions_one_hot = F.one_hot(actions, env.action_space.n).float()
+        new_prob = F.softmax(new_logits[state_id], dim=-1)
+        old_prob = F.softmax(old_logits[state_id], dim=-1)
+        taken_action = actions[state_id]
+        prob_ratios.append(new_prob[taken_action] / old_prob[taken_action])
 
-    # log probability of action we took during the episode
-    log_probs = torch.sum(log_probs_ * actions_one_hot, dim=1)
+        kl_divergances.append(torch.distributions.kl_divergence(old_dist, new_dist))
 
-    # we should maximize
-    # Sum of Advantage * log_probs
-    actor_loss_ = -log_probs * advantages
-    actor_loss = actor_loss_.sum()
+    kl_divergances = torch.stack(kl_divergances)
+    prob_ratios = torch.stack(prob_ratios)
 
-    actor_optimizer_.zero_grad()
-    actor_loss.backward()
-    actor_optimizer_.step()
+    loss = -advantages * prob_ratios + KL_FACTOR * kl_divergances + VF_LOSS_FACTOR * critic_loss
+    optimizer.zero_grad()
+    loss = torch.sum(loss).backward()
+    optimizer.step()
+
 
     return torch.sum(rewards)
 
+
 # %%
-# Actual training happens here
-actor_optimizer = torch.optim.AdamW(actor_net.parameters(), lr=0.001)
-critic_optimizer = torch.optim.AdamW(critic_net.parameters(), lr=0.001)
+# Actual Training happens here!
+
+optimizer = torch.optim.AdamW(list(actor_net.parameters()) + list(critic_net.parameters()), lr=0.001)
 
 episode_rewards = []
+
 for epoch in range(2000):
-    episode_reward = train_step(actor_optimizer, critic_optimizer)
+    episode_reward = train_step(optimizer)
     episode_rewards.append(episode_reward.cpu())
 
     if epoch % 100 == 1:
         print(f"EPOCH {epoch} | episode total reward: {episode_reward:.3f}")
         print(f"EPOCH {epoch} | episode average reward: {np.mean(episode_rewards[-100:]):.3f}")
 
-
 # %%
-# Visualize the train result
-
+# Visualization
 avg_rewards = []
 
 for i in range(len(episode_rewards)):
